@@ -1,0 +1,23 @@
+# dependencies / build
+.venv/
+*.egg-info/
+dist/
+build/
+
+# environment
+.env
+
+# runtime
+.learncode/
+
+# caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# OS
+.DS_Store
+
+notes.md
