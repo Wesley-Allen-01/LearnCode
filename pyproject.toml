@@ -3,12 +3,16 @@ name = "learncode-agent"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
+    "docstring-parser>=0.18.0",
     "openai>=2.0.0",
     "python-dotenv>=1.0.0",
 ]
 
 [project.scripts]
 learncode-agent = "learncode_agent.main:main"
+
+[tool.setuptools.packages.find]
+include = ["learncode_agent*"]
 
 [tool.uv]
 package = true
