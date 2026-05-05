@@ -17,6 +17,8 @@ BLUE = "\033[34m"
 MAGENTA = "\033[35m"
 CYAN = "\033[36m"
 BG_DARK = "\033[48;5;236m"
+BG_RED = "\033[48;5;52m"
+BG_GREEN = "\033[48;5;22m"
 
 
 MODE_COLORS = {
@@ -100,15 +102,15 @@ class PrefixedStream:
         return f"{self.prefix}{text}"
 
 
-def color_unified_diff(diff_text: str) -> str:
+def color_unified_diff(diff_text: str, enable: bool | None = None) -> str:
     colored_lines = []
     for line in diff_text.splitlines(keepends=True):
         if line.startswith(("---", "+++", "@@")):
-            colored_lines.append(colorize(line, CYAN, BOLD))
+            colored_lines.append(colorize(line, CYAN, BOLD, enable=enable))
         elif line.startswith("+"):
-            colored_lines.append(colorize(line, GREEN))
+            colored_lines.append(colorize(line, GREEN, BG_GREEN, enable=enable))
         elif line.startswith("-"):
-            colored_lines.append(colorize(line, RED))
+            colored_lines.append(colorize(line, RED, BG_RED, enable=enable))
         else:
             colored_lines.append(line)
     return "".join(colored_lines)

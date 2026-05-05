@@ -41,7 +41,6 @@ AUTO_PROMPTS = {"plan": "Build Plan", "build": "Start Building"}
 @dataclass(frozen=True)
 class ModeSpec:
     prereq_field: str | None
-    prereq_error: str
     context_fields: tuple[str, ...]
     tools: dict[str, Callable]
 
@@ -49,19 +48,16 @@ class ModeSpec:
 MODES: dict[str, ModeSpec] = {
     "brainstorm": ModeSpec(
         prereq_field=None,
-        prereq_error="",
         context_fields=(),
         tools={},
     ),
     "plan": ModeSpec(
         prereq_field="project_brief",
-        prereq_error="Plan Mode needs a confirmed project brief first.",
         context_fields=("project_brief",),
         tools={},
     ),
     "build": ModeSpec(
         prereq_field="approved_plan",
-        prereq_error="Build Mode needs an approved plan first.",
         context_fields=("approved_plan", "todo_functions"),
         tools={
             "read_file": read_file,
@@ -73,7 +69,6 @@ MODES: dict[str, ModeSpec] = {
     ),
     "critic": ModeSpec(
         prereq_field="todo_functions",
-        prereq_error="Critic Mode needs the planned TODO function list first.",
         context_fields=("todo_functions",),
         tools={
             "read_file": read_file,
@@ -140,7 +135,28 @@ def context_for_mode(mode: str, state: SessionState) -> dict[str, Any]:
     spec = MODES.get(mode)
     if spec is None:
         return {}
-    return {field_name: getattr(state, field_name) for field_name in spec.context_fields}
+    return {
+        field_name: value
+        for field_name in spec.context_fields
+        if (value := getattr(state, field_name))
+    }
+
+
+def missing_context_fields_for_mode(mode: str, state: SessionState) -> list[str]:
+    spec = MODES.get(mode)
+    if spec is None or spec.prereq_field is None:
+        return []
+    return [] if getattr(state, spec.prereq_field) else [spec.prereq_field]
+
+
+def missing_context_message_for_mode(mode: str, fields: list[str]) -> str:
+    field_list = ", ".join(fields)
+    if mode == "build":
+        return (
+            f"Missing optional context: {field_list}. Do not require an approved plan; "
+            "use the user's current request and repository context as the source of truth."
+        )
+    return f"Missing expected context: {field_list}. Ask the user for what you need before proceeding."
 
 
 def initial_messages_for_mode(mode: str, state: SessionState) -> list[dict[str, str]]:
@@ -149,6 +165,9 @@ def initial_messages_for_mode(mode: str, state: SessionState) -> list[dict[str, 
     if context:
         system_prompt += "\n\nContext from previous mode:\n"
         system_prompt += json.dumps(context, indent=2)
+    missing_context_fields = missing_context_fields_for_mode(mode, state)
+    if missing_context_fields:
+        system_prompt += "\n\n" + missing_context_message_for_mode(mode, missing_context_fields)
     return [{"role": "system", "content": system_prompt}]
 
 
@@ -158,25 +177,13 @@ def create_session_state() -> SessionState:
     return state
 
 
-def missing_requirement_message(mode: str) -> str:
-    spec = MODES.get(mode)
-    return spec.prereq_error if spec else ""
-
-
 def can_enter_mode(mode: str, state: SessionState) -> bool:
-    spec = MODES.get(mode)
-    if spec is None:
-        return False
-    if spec.prereq_field is None:
-        return True
-    return bool(getattr(state, spec.prereq_field))
+    return mode in MODES
 
 
 def enter_mode(state: SessionState, mode: str, reset_messages: bool = False) -> str:
     if mode not in MODE_ORDER:
         return f"Unknown mode: {mode}"
-    if not can_enter_mode(mode, state):
-        return missing_requirement_message(mode)
 
     state.mode = mode
     if reset_messages or not state.messages_by_mode[mode]:
@@ -474,7 +481,7 @@ def run_auto_prompt_for_mode(
 
     while state.mode not in prompted_modes:
         auto_prompt = AUTO_PROMPTS.get(state.mode)
-        if not auto_prompt:
+        if not auto_prompt or missing_context_fields_for_mode(state.mode, state):
             return
 
         prompted_modes.add(state.mode)

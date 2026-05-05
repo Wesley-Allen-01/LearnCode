@@ -1,12 +1,16 @@
 import io
 import os
+import threading
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.input import DummyInput
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import DummyOutput
 
 from learncode_agent.main import (
@@ -18,7 +22,9 @@ from learncode_agent.main import (
     apply_handoff,
     can_enter_mode,
     create_session_state,
+    enter_mode,
     extract_handoff,
+    initial_messages_for_mode,
     load_environment,
     load_system_prompt,
     print_banner,
@@ -28,9 +34,27 @@ from learncode_agent.main import (
     stream_assistant_response,
     tool_functions_for_mode,
 )
-from learncode_agent.terminal_style import PrefixedStream, colorize, render_terminal_markdown
-from learncode_agent.tui import TerminalAgentTui, TranscriptEvent, render_event_lines, strip_ansi
+from learncode_agent.terminal_style import (
+    BG_GREEN,
+    BG_RED,
+    PrefixedStream,
+    color_unified_diff,
+    colorize,
+    render_terminal_markdown,
+)
+from learncode_agent.tui import (
+    TerminalAgentTui,
+    TranscriptEvent,
+    format_tool_call_summary,
+    render_event_lines,
+    strip_ansi,
+    tool_event_lines,
+)
 from learncode_agent.tools import command_looks_like_file_mutation
+
+
+def fragment_text(fragments):
+    return "".join(fragment[1] for fragment in fragments)
 
 
 class PromptLoadingTests(unittest.TestCase):
@@ -73,30 +97,58 @@ class EnvironmentLoadingTests(unittest.TestCase):
             self.assertEqual(os.environ["LEARNCODE_TEST_EXISTING_ENV"], "from-shell")
 
 
-class ModePrerequisiteTests(unittest.TestCase):
-    def test_plan_requires_project_brief(self):
+class ModeSwitchingTests(unittest.TestCase):
+    def test_known_modes_do_not_require_artifacts(self):
         state = SessionState()
 
-        self.assertFalse(can_enter_mode("plan", state))
-
-        state.project_brief = {"project_name": "Example"}
         self.assertTrue(can_enter_mode("plan", state))
-
-    def test_build_requires_approved_plan(self):
-        state = SessionState()
-
-        self.assertFalse(can_enter_mode("build", state))
-
-        state.approved_plan = {"steps": []}
         self.assertTrue(can_enter_mode("build", state))
+        self.assertTrue(can_enter_mode("critic", state))
 
-    def test_critic_requires_todo_functions(self):
+    def test_enter_mode_switches_without_artifact(self):
         state = SessionState()
 
-        self.assertFalse(can_enter_mode("critic", state))
+        message = enter_mode(state, "build")
 
-        state.todo_functions = [{"name": "score_item"}]
-        self.assertTrue(can_enter_mode("critic", state))
+        self.assertEqual(message, "Switched to Build Mode.")
+        self.assertEqual(state.mode, "build")
+
+    def test_unknown_mode_is_rejected(self):
+        state = SessionState()
+
+        message = enter_mode(state, "review")
+
+        self.assertFalse(can_enter_mode("review", state))
+        self.assertEqual(message, "Unknown mode: review")
+        self.assertEqual(state.mode, "brainstorm")
+
+
+class ModePromptContextTests(unittest.TestCase):
+    def test_plan_prompt_notes_missing_project_brief(self):
+        messages = initial_messages_for_mode("plan", SessionState())
+
+        self.assertIn(
+            "Missing expected context: project_brief. Ask the user for what you need before proceeding.",
+            messages[0]["content"],
+        )
+
+    def test_build_prompt_treats_missing_approved_plan_as_optional(self):
+        messages = initial_messages_for_mode("build", SessionState())
+
+        self.assertIn(
+            "Missing optional context: approved_plan. Do not require an approved plan;",
+            messages[0]["content"],
+        )
+        self.assertIn("user's current request and repository context", messages[0]["content"])
+
+    def test_truthy_artifacts_are_injected_as_context(self):
+        state = SessionState(project_brief={"project_name": "Quiz CLI"})
+
+        messages = initial_messages_for_mode("plan", state)
+
+        self.assertIn("Context from previous mode:", messages[0]["content"])
+        self.assertIn('"project_name": "Quiz CLI"', messages[0]["content"])
+        self.assertNotIn("Missing expected context", messages[0]["content"])
 
 
 class ToolPolicyTests(unittest.TestCase):
@@ -280,6 +332,30 @@ class StreamingHelperTests(unittest.TestCase):
         self.assertEqual(AUTO_PROMPTS, {"plan": "Build Plan", "build": "Start Building"})
         self.assertIsNone(AUTO_PROMPTS.get("critic"))
 
+    def test_plan_auto_prompt_skips_without_project_brief(self):
+        class FakeCompletions:
+            def create(self, **kwargs):
+                raise AssertionError("auto prompt should not call the model")
+
+        state = SessionState(mode="plan")
+        client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+        run_auto_prompt_for_mode(client, "test", state)
+
+        self.assertEqual(state.messages_by_mode["plan"], [])
+
+    def test_build_auto_prompt_skips_without_approved_plan(self):
+        class FakeCompletions:
+            def create(self, **kwargs):
+                raise AssertionError("auto prompt should not call the model")
+
+        state = SessionState(mode="build")
+        client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+        run_auto_prompt_for_mode(client, "test", state)
+
+        self.assertEqual(state.messages_by_mode["build"], [])
+
     def test_run_auto_prompt_for_plan_mode_sends_build_plan(self):
         class FakeCompletions:
             def create(self, **kwargs):
@@ -387,6 +463,12 @@ class TerminalStyleTests(unittest.TestCase):
         self.assertIn("Important", rendered_output)
         self.assertNotIn("**Important**", rendered_output)
 
+    def test_color_unified_diff_uses_backgrounds_for_changed_lines(self):
+        rendered_output = color_unified_diff("-old\n+new\n unchanged\n", enable=True)
+
+        self.assertIn(BG_RED, rendered_output)
+        self.assertIn(BG_GREEN, rendered_output)
+
     def test_prompt_session_kwargs_uses_supported_prompt_arguments(self):
         kwargs = prompt_session_kwargs(SessionState())
 
@@ -421,13 +503,22 @@ class TuiRenderingTests(unittest.TestCase):
 
         self.assertEqual(lines[0], [("class:assistant-dot", "● "), ("class:assistant", "Hi!")])
 
+    def test_tool_event_lines_style_diff_changes_with_background_classes(self):
+        lines = tool_event_lines("--- a/main.py\n+++ b/main.py\n-old\n+new")
+
+        self.assertEqual(lines[0], [("class:tool", "● "), ("class:tool", "--- a/main.py")])
+        self.assertEqual(lines[1], [("class:tool", "+++ b/main.py")])
+        self.assertEqual(lines[2], [("class:diff-del", "-old")])
+        self.assertEqual(lines[3], [("class:diff-add", "+new")])
+
     def test_status_line_shows_mode_and_shortcut_hint(self):
         ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState(mode="plan"))
 
         rendered_status = "".join(text for _, text in ui.render_status())
 
         self.assertIn("plan mode on", rendered_status)
-        self.assertIn("shift+tab to cycle", rendered_status)
+        self.assertIn("pgup/pgdn or wheel scroll", rendered_status)
+        self.assertIn("shift+tab mode", rendered_status)
 
     def test_transcript_renderer_keeps_full_history_for_scrollback(self):
         ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
@@ -436,17 +527,144 @@ class TuiRenderingTests(unittest.TestCase):
             TranscriptEvent("user", "Second message"),
         ]
 
-        rendered_transcript = "".join(text for _, text in ui.render_transcript())
+        rendered_transcript = fragment_text(ui.render_transcript())
 
         self.assertIn("First response", rendered_transcript)
         self.assertIn("Second message", rendered_transcript)
 
-    def test_application_uses_normal_terminal_buffer_for_scrollback(self):
+    def test_transcript_cursor_tracks_last_rendered_line(self):
+        ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
+        ui.events.extend(
+            TranscriptEvent("assistant", f"Response {index}")
+            for index in range(30)
+        )
+
+        line_count = len(ui.visible_transcript_lines(width=80))
+        cursor_position = ui.transcript_cursor_position()
+
+        self.assertEqual(cursor_position.y, line_count - 1)
+
+    def test_transcript_can_scroll_up_from_live_bottom(self):
+        ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
+        ui.events.extend(
+            TranscriptEvent("assistant", f"Response {index}")
+            for index in range(30)
+        )
+
+        ui.scroll_transcript(5)
+
+        self.assertEqual(ui.transcript_scroll_offset, 5)
+        self.assertEqual(ui.transcript_vertical_scroll(SimpleNamespace()), 0)
+
+    def test_transcript_viewport_shows_earliest_event_at_top_scroll(self):
+        ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
+        ui.events = [
+            TranscriptEvent("assistant", "First response"),
+            *[
+                TranscriptEvent("assistant", f"Response {index}")
+                for index in range(10)
+            ],
+        ]
+
+        terminal_size = os.terminal_size((80, 8))
+        with patch("learncode_agent.tui.shutil.get_terminal_size", return_value=terminal_size):
+            ui.scroll_transcript_to_top()
+            rendered_transcript = fragment_text(ui.render_transcript())
+
+        self.assertIn("First response", rendered_transcript)
+        self.assertNotIn("Response 9", rendered_transcript)
+
+    def test_transcript_scroll_is_capped_to_available_history(self):
+        ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
+        ui.events.extend(
+            TranscriptEvent("assistant", f"Response {index}")
+            for index in range(5)
+        )
+
+        ui.scroll_transcript(10_000)
+
+        self.assertEqual(
+            ui.transcript_scroll_offset,
+            ui.max_transcript_scroll_offset(),
+        )
+
+    def test_transcript_scroll_reclamps_after_viewport_height_changes(self):
+        ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
+        ui.events = [
+            TranscriptEvent("assistant", f"Response {index}")
+            for index in range(20)
+        ]
+
+        short_terminal = os.terminal_size((80, 8))
+        tall_terminal = os.terminal_size((80, 18))
+        with patch("learncode_agent.tui.shutil.get_terminal_size", return_value=short_terminal):
+            ui.scroll_transcript_to_top()
+            self.assertEqual(ui.transcript_scroll_offset, 16)
+
+        with patch("learncode_agent.tui.shutil.get_terminal_size", return_value=tall_terminal):
+            ui.visible_transcript_lines(width=80)
+            self.assertEqual(ui.transcript_scroll_offset, 6)
+
+    def test_page_scroll_helpers_use_transcript_offset(self):
+        ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
+        ui.events = [
+            TranscriptEvent("assistant", f"Response {index}")
+            for index in range(20)
+        ]
+
+        terminal_size = os.terminal_size((80, 8))
+        with patch("learncode_agent.tui.shutil.get_terminal_size", return_value=terminal_size):
+            ui.scroll_transcript_page_up()
+            self.assertEqual(ui.transcript_scroll_offset, 3)
+
+            ui.scroll_transcript_page_down()
+            self.assertEqual(ui.transcript_scroll_offset, 0)
+
+    def test_mouse_wheel_scrolls_transcript_offset(self):
+        ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
+        ui.events = [
+            TranscriptEvent("assistant", f"Response {index}")
+            for index in range(20)
+        ]
+        mouse_event = MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.SCROLL_UP,
+            button=MouseButton.NONE,
+            modifiers=frozenset(),
+        )
+
+        terminal_size = os.terminal_size((80, 8))
+        with patch("learncode_agent.tui.shutil.get_terminal_size", return_value=terminal_size):
+            ui.handle_transcript_mouse(mouse_event)
+
+        self.assertEqual(ui.transcript_scroll_offset, 3)
+
+    def test_status_line_shows_scrolled_transcript_state(self):
+        ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
+        ui.transcript_scroll_offset = 3
+
+        rendered_status = "".join(text for _, text in ui.render_status())
+
+        self.assertIn("scrolled 3 lines", rendered_status)
+
+    def test_tui_starts_with_banner_before_first_user_message(self):
+        ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
+        ui.events.append(TranscriptEvent("user", "First message"))
+
+        rendered_transcript = fragment_text(ui.render_transcript())
+
+        self.assertLess(
+            rendered_transcript.index(" _      _____"),
+            rendered_transcript.index("First message"),
+        )
+
+    def test_application_uses_full_screen_app_managed_scrollback(self):
         ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
 
         app = ui.build_application(DummyInput(), DummyOutput())
 
-        self.assertFalse(app.full_screen)
+        self.assertTrue(app.full_screen)
+        self.assertTrue(app.mouse_support())
 
     def test_tool_preview_flushes_before_approval_request(self):
         ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
@@ -458,7 +676,7 @@ class TuiRenderingTests(unittest.TestCase):
 
         def fake_request_approval(prompt):
             nonlocal saw_preview_before_approval
-            saw_preview_before_approval = bool(ui.events and ui.events[0].text == "Preview")
+            saw_preview_before_approval = any(event.text == "Preview" for event in ui.events)
             return "y"
 
         ui.request_approval = fake_request_approval
@@ -467,6 +685,48 @@ class TuiRenderingTests(unittest.TestCase):
 
         self.assertEqual(result, "y")
         self.assertTrue(saw_preview_before_approval)
+
+    def test_approval_request_includes_pending_tool_summary(self):
+        ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
+        ui.tool_call("run_bash_command", {"command": "python -m unittest"})
+
+        def fake_tool():
+            return input("Approve? [y/N]: ")
+
+        def submit_approval():
+            ui.submit_approval("y")
+
+        original_request_approval = ui.request_approval
+
+        def request_and_submit(prompt):
+            result = original_request_approval(prompt)
+            return result
+
+        ui.request_approval = request_and_submit
+        timer = threading.Timer(0.01, submit_approval)
+        timer.start()
+        result = ui.execute_tool(fake_tool, {})
+        timer.join()
+
+        approval_events = [
+            event.text
+            for event in ui.events
+            if "Type y and press Enter to approve." in event.text
+        ]
+        self.assertEqual(result, "y")
+        self.assertTrue(approval_events)
+        self.assertIn("Pending Tool call run_bash_command", approval_events[-1])
+        self.assertIn("python -m unittest", approval_events[-1])
+
+    def test_tool_call_summary_abbreviates_long_string_arguments(self):
+        summary = format_tool_call_summary("write_file", {
+            "path": "app.py",
+            "content": "x" * 300,
+        })
+
+        self.assertIn("Tool call write_file", summary)
+        self.assertIn("app.py", summary)
+        self.assertIn("[300 chars total]", summary)
 
 
 if __name__ == "__main__":

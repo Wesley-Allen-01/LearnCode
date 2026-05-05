@@ -14,13 +14,16 @@ from typing import Any
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.styles import Style
 
 from learncode_agent.main import (
+    LEARNCODE_BANNER,
     SessionState,
     append_user_message,
     cycle_mode,
@@ -53,12 +56,14 @@ class TerminalAgentTui:
         self.client = client
         self.model = model
         self.state = state
-        self.events: list[TranscriptEvent] = []
+        self.events: list[TranscriptEvent] = [TranscriptEvent("banner", LEARNCODE_BANNER)]
         self.input_buffer = Buffer(multiline=False, accept_handler=self.submit_input)
         self.lock = threading.RLock()
         self.is_busy = False
         self.current_assistant_event: TranscriptEvent | None = None
         self.pending_approval: ApprovalRequest | None = None
+        self.pending_tool_summary = ""
+        self.transcript_scroll_offset = 0
         self.app: Application | None = None
 
     def run(self) -> int:
@@ -76,6 +81,22 @@ class TerminalAgentTui:
         def _(event: Any) -> None:
             self.cycle_mode()
 
+        @key_bindings.add("pageup")
+        def _(event: Any) -> None:
+            self.scroll_transcript_page_up()
+
+        @key_bindings.add("pagedown")
+        def _(event: Any) -> None:
+            self.scroll_transcript_page_down()
+
+        @key_bindings.add("c-home")
+        def _(event: Any) -> None:
+            self.scroll_transcript_to_top()
+
+        @key_bindings.add("c-end")
+        def _(event: Any) -> None:
+            self.scroll_transcript_to_bottom()
+
         @key_bindings.add("c-c")
         @key_bindings.add("c-d")
         def _(event: Any) -> None:
@@ -83,8 +104,14 @@ class TerminalAgentTui:
 
         input_control = BufferControl(buffer=self.input_buffer)
         transcript = Window(
-            content=FormattedTextControl(self.render_transcript),
+            content=FormattedTextControl(
+                self.render_transcript,
+                get_cursor_position=self.transcript_cursor_position,
+                show_cursor=False,
+            ),
             wrap_lines=False,
+            get_vertical_scroll=self.transcript_vertical_scroll,
+            always_hide_cursor=True,
             style="class:body",
         )
         input_row = VSplit(
@@ -136,10 +163,14 @@ class TerminalAgentTui:
                 "assistant-dot": "bg:#282c34 #ffffff bold",
                 "assistant": "bg:#282c34 #f8f8f2",
                 "tool": "bg:#282c34 #d7ba7d",
+                "diff-add": "bg:#183d24 #c6f6d5",
+                "diff-del": "bg:#4a1f1f #fed7d7",
                 "status-event": "bg:#282c34 #4db6ac",
                 "error": "bg:#282c34 #f48771 bold",
+                "banner": "bg:#282c34 #4db6ac bold",
             }),
-            full_screen=False,
+            full_screen=True,
+            mouse_support=True,
         )
 
     def submit_input(self, buffer: Buffer) -> bool:
@@ -158,6 +189,7 @@ class TerminalAgentTui:
             self.status("Agent is still responding.", self.state.mode)
             return True
 
+        self.scroll_transcript_to_bottom()
         requested_mode = parse_mode_command(text)
         if requested_mode:
             self.enter_requested_mode(requested_mode)
@@ -264,8 +296,8 @@ class TerminalAgentTui:
 
     def tool_call(self, function_name: str, kwargs: dict[str, Any]) -> None:
         self.current_assistant_event = None
-        arguments = json.dumps(kwargs, indent=2)
-        self.add_event("tool", f"Tool call {function_name}({arguments})")
+        self.pending_tool_summary = format_tool_call_summary(function_name, kwargs)
+        self.add_event("tool", self.pending_tool_summary)
 
     def tool_output(self, text: str) -> None:
         self.current_assistant_event = None
@@ -281,10 +313,12 @@ class TerminalAgentTui:
 
     def execute_tool(self, func: Callable, kwargs: dict[str, Any]) -> Any:
         output = io.StringIO()
-        with redirect_stdout(output), self.patch_input(output):
-            result = func(**kwargs)
-        self.tool_output(output.getvalue())
-        return result
+        try:
+            with redirect_stdout(output), self.patch_input(output):
+                return func(**kwargs)
+        finally:
+            self.tool_output(output.getvalue())
+            self.pending_tool_summary = ""
 
     @contextmanager
     def patch_input(self, output: io.StringIO) -> Any:
@@ -310,7 +344,10 @@ class TerminalAgentTui:
         request = ApprovalRequest(strip_ansi(prompt).strip(), threading.Event())
         with self.lock:
             self.pending_approval = request
-        self.add_event("tool", f"{request.prompt} Type y and press Enter to approve.")
+        message = f"{request.prompt} Type y and press Enter to approve."
+        if self.pending_tool_summary:
+            message = f"Pending {self.pending_tool_summary}\n{message}"
+        self.add_event("tool", message)
         request.submitted.wait()
         with self.lock:
             if self.pending_approval is request:
@@ -329,26 +366,121 @@ class TerminalAgentTui:
 
     def render_transcript(self) -> StyleAndTextTuples:
         width = shutil.get_terminal_size((80, 20)).columns
+        lines = self.visible_transcript_lines(width)
+
+        fragments: StyleAndTextTuples = []
+        for line in lines:
+            fragments.extend(self.with_transcript_mouse_handler(line, width))
+            fragments.append(("", "\n"))
+        return fragments
+
+    def transcript_cursor_position(self) -> Point:
+        width = shutil.get_terminal_size((80, 20)).columns
+        line_count = len(self.visible_transcript_lines(width))
+        return Point(x=0, y=max(0, line_count - 1))
+
+    def transcript_vertical_scroll(self, window: Window) -> int:
+        return 0
+
+    def transcript_top_line(self, line_count: int) -> int:
+        height = self.transcript_height()
+        self.transcript_scroll_offset = min(
+            self.transcript_scroll_offset,
+            self.max_transcript_scroll_offset(line_count),
+        )
+        return max(0, line_count - height - self.transcript_scroll_offset)
+
+    def max_transcript_scroll_offset(self, line_count: int | None = None) -> int:
+        if line_count is None:
+            width = shutil.get_terminal_size((80, 20)).columns
+            line_count = len(self.rendered_transcript_lines(width))
+        return max(0, line_count - self.transcript_height())
+
+    def transcript_height(self) -> int:
+        return max(1, shutil.get_terminal_size((80, 20)).lines - 4)
+
+    def transcript_page_size(self) -> int:
+        return max(1, self.transcript_height() - 1)
+
+    def scroll_transcript_page_up(self) -> None:
+        self.scroll_transcript(self.transcript_page_size())
+
+    def scroll_transcript_page_down(self) -> None:
+        self.scroll_transcript(-self.transcript_page_size())
+
+    def scroll_transcript(self, delta: int) -> None:
+        self.transcript_scroll_offset = max(
+            0,
+            min(
+                self.transcript_scroll_offset + delta,
+                self.max_transcript_scroll_offset(),
+            ),
+        )
+        self.invalidate()
+
+    def scroll_transcript_to_bottom(self) -> None:
+        self.transcript_scroll_offset = 0
+        self.invalidate()
+
+    def scroll_transcript_to_top(self) -> None:
+        self.transcript_scroll_offset = self.max_transcript_scroll_offset()
+        self.invalidate()
+
+    def visible_transcript_lines(self, width: int) -> list[StyleAndTextTuples]:
+        lines = self.rendered_transcript_lines(width)
+        top_line = self.transcript_top_line(len(lines))
+        return lines[top_line:top_line + self.transcript_height()]
+
+    def rendered_transcript_lines(self, width: int) -> list[StyleAndTextTuples]:
         lines: list[StyleAndTextTuples] = []
         with self.lock:
             events = list(self.events)
 
         for event in events:
             lines.extend(render_event_lines(event, width))
+        return lines
 
+    def with_transcript_mouse_handler(
+        self,
+        line: StyleAndTextTuples,
+        width: int,
+    ) -> StyleAndTextTuples:
         fragments: StyleAndTextTuples = []
-        for line in lines:
-            fragments.extend(line)
-            fragments.append(("", "\n"))
+        text_width = 0
+        for fragment in line:
+            text_width += len(fragment[1])
+            if len(fragment) >= 3:
+                fragments.append(fragment)
+            else:
+                fragments.append((fragment[0], fragment[1], self.handle_transcript_mouse))
+
+        if text_width < width:
+            fragments.append(
+                ("class:body", " " * (width - text_width), self.handle_transcript_mouse)
+            )
         return fragments
+
+    def handle_transcript_mouse(self, mouse_event: MouseEvent) -> None:
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            self.scroll_transcript(3)
+        elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            self.scroll_transcript(-3)
 
     def render_status(self) -> StyleAndTextTuples:
         busy_text = " working" if self.is_busy else ""
         approval_text = " approve tool request" if self.pending_approval else ""
+        scroll_text = (
+            f" scrolled {self.transcript_scroll_offset} lines"
+            if self.transcript_scroll_offset
+            else ""
+        )
         return [
             ("class:status-quote", ' "'),
             ("class:status-mode", f" {self.state.mode} mode on"),
-            ("class:status-hint", f"{busy_text}{approval_text} (shift+tab to cycle)"),
+            (
+                "class:status-hint",
+                f"{busy_text}{approval_text}{scroll_text} (pgup/pgdn or wheel scroll, shift+tab mode)",
+            ),
         ]
 
     def invalidate(self) -> None:
@@ -358,6 +490,24 @@ class TerminalAgentTui:
 
 def strip_ansi(text: str) -> str:
     return ANSI_RE.sub("", text)
+
+
+def format_tool_call_summary(function_name: str, kwargs: dict[str, Any]) -> str:
+    arguments = {
+        key: summarize_tool_argument(value)
+        for key, value in kwargs.items()
+    }
+    return f"Tool call {function_name}({json.dumps(arguments, indent=2)})"
+
+
+def summarize_tool_argument(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+
+    single_line = value.replace("\n", "\\n")
+    if len(single_line) <= 240:
+        return single_line
+    return f"{single_line[:240]}... [{len(value)} chars total]"
 
 
 def render_event_lines(event: TranscriptEvent, width: int) -> list[StyleAndTextTuples]:
@@ -370,8 +520,11 @@ def render_event_lines(event: TranscriptEvent, width: int) -> list[StyleAndTextT
     if event.kind == "assistant":
         return prefixed_lines(text, "● ", "class:assistant-dot", "class:assistant")
 
+    if event.kind == "banner":
+        return [[("class:banner", line)] for line in text.splitlines()]
+
     if event.kind == "tool":
-        return prefixed_lines(text, "● ", "class:tool", "class:tool")
+        return tool_event_lines(text)
 
     if event.kind == "error":
         return prefixed_lines(text, "● ", "class:error", "class:error")
@@ -393,6 +546,26 @@ def prefixed_lines(
         else:
             lines.append([(text_style, line)])
     return lines
+
+
+def tool_event_lines(text: str) -> list[StyleAndTextTuples]:
+    raw_lines = text.splitlines() or [""]
+    lines: list[StyleAndTextTuples] = []
+    for index, line in enumerate(raw_lines):
+        text_style = diff_line_style(line)
+        if index == 0:
+            lines.append([("class:tool", "● "), (text_style, line)])
+        else:
+            lines.append([(text_style, line)])
+    return lines
+
+
+def diff_line_style(line: str) -> str:
+    if line.startswith("+") and not line.startswith("+++"):
+        return "class:diff-add"
+    if line.startswith("-") and not line.startswith("---"):
+        return "class:diff-del"
+    return "class:tool"
 
 
 def run_tui(client: Any, model: str, state: SessionState) -> int:
