@@ -367,7 +367,7 @@ def stream_assistant_response(client: Any, request_kwargs: dict[str, Any]) -> di
         rendered_output = render_terminal_markdown(visible_content)
         terminal_output = assistant_output.feed(rendered_output)
         terminal_output += assistant_output.flush()
-        print(terminal_output, end="", flush=True)
+        print(f"\n{terminal_output}", end="", flush=True)
         print("\n")
 
     message: dict[str, Any] = {

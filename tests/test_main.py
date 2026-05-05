@@ -234,6 +234,7 @@ class StreamingHelperTests(unittest.TestCase):
 
         self.assertEqual(message["content"], "**Hello**\nWorld")
         self.assertIn("● Hello World", output.getvalue())
+        self.assertTrue(output.getvalue().startswith("\n● Hello World"))
         self.assertNotIn("**Hello**", output.getvalue())
 
     def test_auto_prompts_cover_plan_and_build_only(self):
