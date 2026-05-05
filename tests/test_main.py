@@ -6,6 +6,9 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
+from prompt_toolkit.input import DummyInput
+from prompt_toolkit.output import DummyOutput
+
 from learncode_agent.main import (
     AUTO_PROMPTS,
     HandoffOutputFilter,
@@ -26,6 +29,7 @@ from learncode_agent.main import (
     tool_functions_for_mode,
 )
 from learncode_agent.terminal_style import PrefixedStream, colorize, render_terminal_markdown
+from learncode_agent.tui import TerminalAgentTui, TranscriptEvent, render_event_lines, strip_ansi
 from learncode_agent.tools import command_looks_like_file_mutation
 
 
@@ -237,6 +241,41 @@ class StreamingHelperTests(unittest.TestCase):
         self.assertTrue(output.getvalue().startswith("\n● Hello World"))
         self.assertNotIn("**Hello**", output.getvalue())
 
+    def test_stream_assistant_response_can_stream_to_callback_without_stdout(self):
+        class FakeCompletions:
+            def create(self, **kwargs):
+                yield SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content="Hello\nLEAR")
+                        )
+                    ]
+                )
+                yield SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content='NCODE_HANDOFF: {"next_mode":"plan"}')
+                        )
+                    ]
+                )
+
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=FakeCompletions())
+        )
+        visible_chunks = []
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            message = stream_assistant_response(
+                client,
+                {"model": "test", "messages": []},
+                on_visible_text=visible_chunks.append,
+            )
+
+        self.assertEqual(message["content"], 'Hello\nLEARNCODE_HANDOFF: {"next_mode":"plan"}')
+        self.assertEqual("".join(visible_chunks), "Hello\n")
+        self.assertEqual(output.getvalue(), "")
+
     def test_auto_prompts_cover_plan_and_build_only(self):
         self.assertEqual(AUTO_PROMPTS, {"plan": "Build Plan", "build": "Start Building"})
         self.assertIsNone(AUTO_PROMPTS.get("critic"))
@@ -365,6 +404,69 @@ class TerminalStyleTests(unittest.TestCase):
         self.assertIn(" _      _____", output.getvalue())
         self.assertIn("|_____||_____", output.getvalue())
         self.assertEqual(len(LEARNCODE_BANNER.splitlines()), 5)
+
+
+class TuiRenderingTests(unittest.TestCase):
+    def test_strip_ansi_removes_color_codes(self):
+        self.assertEqual(strip_ansi("\033[1mApprove?\033[0m"), "Approve?")
+
+    def test_render_user_event_uses_highlighted_prompt_row(self):
+        lines = render_event_lines(TranscriptEvent("user", "hi"), width=10)
+
+        self.assertEqual(lines[0][0], ("class:user-chevron", "› "))
+        self.assertEqual(lines[0][1], ("class:user-row", "hi      "))
+
+    def test_render_assistant_event_uses_dot_prefix(self):
+        lines = render_event_lines(TranscriptEvent("assistant", "Hi!"), width=80)
+
+        self.assertEqual(lines[0], [("class:assistant-dot", "● "), ("class:assistant", "Hi!")])
+
+    def test_status_line_shows_mode_and_shortcut_hint(self):
+        ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState(mode="plan"))
+
+        rendered_status = "".join(text for _, text in ui.render_status())
+
+        self.assertIn("plan mode on", rendered_status)
+        self.assertIn("shift+tab to cycle", rendered_status)
+
+    def test_transcript_renderer_keeps_full_history_for_scrollback(self):
+        ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
+        ui.events = [
+            TranscriptEvent("assistant", "First response"),
+            TranscriptEvent("user", "Second message"),
+        ]
+
+        rendered_transcript = "".join(text for _, text in ui.render_transcript())
+
+        self.assertIn("First response", rendered_transcript)
+        self.assertIn("Second message", rendered_transcript)
+
+    def test_application_uses_normal_terminal_buffer_for_scrollback(self):
+        ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
+
+        app = ui.build_application(DummyInput(), DummyOutput())
+
+        self.assertFalse(app.full_screen)
+
+    def test_tool_preview_flushes_before_approval_request(self):
+        ui = TerminalAgentTui(SimpleNamespace(), "test", SessionState())
+        saw_preview_before_approval = False
+
+        def fake_tool():
+            print("Preview")
+            return input("Approve? [y/N]: ")
+
+        def fake_request_approval(prompt):
+            nonlocal saw_preview_before_approval
+            saw_preview_before_approval = bool(ui.events and ui.events[0].text == "Preview")
+            return "y"
+
+        ui.request_approval = fake_request_approval
+
+        result = ui.execute_tool(fake_tool, {})
+
+        self.assertEqual(result, "y")
+        self.assertTrue(saw_preview_before_approval)
 
 
 if __name__ == "__main__":

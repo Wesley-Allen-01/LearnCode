@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from dotenv import load_dotenv
 from prompt_toolkit.formatted_text import ANSI
@@ -100,6 +100,20 @@ class SessionState:
     messages_by_mode: dict[str, list[Any]] = field(
         default_factory=lambda: {mode: [] for mode in MODE_ORDER}
     )
+
+
+class AgentOutputSink(Protocol):
+    def assistant_delta(self, text: str) -> None:
+        ...
+
+    def status(self, message: str, mode: str | None = None) -> None:
+        ...
+
+    def error(self, message: str) -> None:
+        ...
+
+    def tool_call(self, function_name: str, kwargs: dict[str, Any]) -> None:
+        ...
 
 
 def load_system_prompt(path: Path) -> str:
@@ -295,13 +309,24 @@ def append_user_message(state: SessionState, content: str) -> None:
     state.messages_by_mode[state.mode].append({"role": "user", "content": content})
 
 
-def handle_streamed_handoff(state: SessionState, content: str) -> str | None:
+def handle_streamed_handoff(
+    state: SessionState,
+    content: str,
+    output_sink: AgentOutputSink | None = None,
+) -> str | None:
     _, handoff_payload, handoff_error = extract_handoff(content)
     if handoff_error:
-        print_error(handoff_error)
+        if output_sink:
+            output_sink.error(handoff_error)
+        else:
+            print_error(handoff_error)
     if handoff_payload:
         previous_mode = state.mode
-        print_status(apply_handoff(state, handoff_payload), state.mode)
+        message = apply_handoff(state, handoff_payload)
+        if output_sink:
+            output_sink.status(message, state.mode)
+        else:
+            print_status(message, state.mode)
         if state.mode != previous_mode:
             return state.mode
     return None
@@ -335,7 +360,11 @@ def append_tool_call_delta(tool_calls: dict[int, dict[str, Any]], tool_call_delt
         tool_call["function"]["arguments"] += function_arguments
 
 
-def stream_assistant_response(client: Any, request_kwargs: dict[str, Any]) -> dict[str, Any]:
+def stream_assistant_response(
+    client: Any,
+    request_kwargs: dict[str, Any],
+    on_visible_text: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     stream = client.chat.completions.create(**request_kwargs, stream=True)
     content_parts: list[str] = []
     visible_parts: list[str] = []
@@ -353,6 +382,8 @@ def stream_assistant_response(client: Any, request_kwargs: dict[str, Any]) -> di
             visible_delta = output_filter.feed(content_delta)
             if visible_delta:
                 visible_parts.append(visible_delta)
+                if on_visible_text:
+                    on_visible_text(visible_delta)
 
         for tool_call_delta in getattr(delta, "tool_calls", None) or []:
             append_tool_call_delta(tool_calls, tool_call_delta)
@@ -360,9 +391,11 @@ def stream_assistant_response(client: Any, request_kwargs: dict[str, Any]) -> di
     visible_tail = output_filter.flush()
     if visible_tail:
         visible_parts.append(visible_tail)
+        if on_visible_text:
+            on_visible_text(visible_tail)
 
     visible_content = "".join(visible_parts)
-    if visible_content:
+    if visible_content and not on_visible_text:
         assistant_output = PrefixedStream(colorize("●", BOLD) + " ")
         rendered_output = render_terminal_markdown(visible_content)
         terminal_output = assistant_output.feed(rendered_output)
@@ -379,7 +412,13 @@ def stream_assistant_response(client: Any, request_kwargs: dict[str, Any]) -> di
     return message
 
 
-def run_agent_turn(client: Any, model: str, state: SessionState) -> str | None:
+def run_agent_turn(
+    client: Any,
+    model: str,
+    state: SessionState,
+    output_sink: AgentOutputSink | None = None,
+    tool_executor: Callable[[Callable, dict[str, Any]], Any] | None = None,
+) -> str | None:
     messages = state.messages_by_mode[state.mode]
 
     while True:
@@ -392,20 +431,31 @@ def run_agent_turn(client: Any, model: str, state: SessionState) -> str | None:
             request_kwargs["tools"] = tool_schemas_for_functions(tool_functions)
             request_kwargs["tool_choice"] = "auto"
 
-        message = stream_assistant_response(client, request_kwargs)
+        message = stream_assistant_response(
+            client,
+            request_kwargs,
+            output_sink.assistant_delta if output_sink else None,
+        )
         messages.append(message)
 
         if not message.get("tool_calls"):
-            return handle_streamed_handoff(state, message.get("content") or "")
+            return handle_streamed_handoff(
+                state,
+                message.get("content") or "",
+                output_sink,
+            )
 
         for tool_call in message["tool_calls"]:
             function_name = tool_call["function"]["name"]
             func = tool_functions[function_name]
             kwargs = json.loads(tool_call["function"]["arguments"])
-            tool_label = f"{colorize('●', BOLD, YELLOW)} Tool call"
-            function_label = colorize(function_name, BOLD, MAGENTA)
-            print(f"{tool_label} {function_label}({json.dumps(kwargs, indent=2)})\n")
-            result = func(**kwargs)
+            if output_sink:
+                output_sink.tool_call(function_name, kwargs)
+            else:
+                tool_label = f"{colorize('●', BOLD, YELLOW)} Tool call"
+                function_label = colorize(function_name, BOLD, MAGENTA)
+                print(f"{tool_label} {function_label}({json.dumps(kwargs, indent=2)})\n")
+            result = tool_executor(func, kwargs) if tool_executor else func(**kwargs)
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call["id"],
@@ -413,7 +463,13 @@ def run_agent_turn(client: Any, model: str, state: SessionState) -> str | None:
             })
 
 
-def run_auto_prompt_for_mode(client: Any, model: str, state: SessionState) -> None:
+def run_auto_prompt_for_mode(
+    client: Any,
+    model: str,
+    state: SessionState,
+    output_sink: AgentOutputSink | None = None,
+    tool_executor: Callable[[Callable, dict[str, Any]], Any] | None = None,
+) -> None:
     prompted_modes: set[str] = set()
 
     while state.mode not in prompted_modes:
@@ -423,64 +479,19 @@ def run_auto_prompt_for_mode(client: Any, model: str, state: SessionState) -> No
 
         prompted_modes.add(state.mode)
         append_user_message(state, auto_prompt)
-        if not run_agent_turn(client, model, state):
+        if not run_agent_turn(client, model, state, output_sink, tool_executor):
             return
 
 
 def main() -> int:
     from openai import OpenAI
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.application import run_in_terminal
-    from prompt_toolkit.key_binding import KeyBindings
+    from learncode_agent.tui import run_tui
 
     load_environment()
     client = OpenAI()
     model = os.getenv("LEARNCODE_MODEL", "gpt-4.1-mini")
     state = create_session_state()
-
-    key_bindings = KeyBindings()
-
-    @key_bindings.add("s-tab")
-    def _(event: Any) -> None:
-        previous_mode = state.mode
-        message = cycle_mode(state)
-
-        def announce_mode_change() -> None:
-            print(f"\n{colorize(message, BOLD, mode_color(state.mode))}\n")
-            if state.mode != previous_mode:
-                run_auto_prompt_for_mode(client, model, state)
-
-        run_in_terminal(announce_mode_change)
-        event.app.invalidate()
-
-    session = PromptSession(key_bindings=key_bindings)
-    print_banner()
-
-    while True:
-        try:
-            user_text = session.prompt(**prompt_session_kwargs(state)).strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye!")
-            return 0
-
-        if not user_text:
-            continue
-        if user_text in ("quit", "q"):
-            print("Goodbye!")
-            return 0
-
-        requested_mode = parse_mode_command(user_text)
-        if requested_mode:
-            previous_mode = state.mode
-            message = enter_mode(state, requested_mode)
-            print_status(message, state.mode)
-            if state.mode != previous_mode:
-                run_auto_prompt_for_mode(client, model, state)
-            continue
-
-        append_user_message(state, user_text)
-        if run_agent_turn(client, model, state):
-            run_auto_prompt_for_mode(client, model, state)
+    return run_tui(client, model, state)
 
 
 if __name__ == "__main__":
