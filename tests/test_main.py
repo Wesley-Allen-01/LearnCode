@@ -1,9 +1,7 @@
-import io
 import os
 import threading
 import tempfile
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -20,16 +18,12 @@ from learncode_agent.main import (
     SessionState,
     append_tool_call_delta,
     apply_handoff,
-    can_enter_mode,
     create_session_state,
     enter_mode,
     extract_handoff,
     initial_messages_for_mode,
     load_environment,
     load_system_prompt,
-    print_banner,
-    prompt_text,
-    prompt_session_kwargs,
     run_auto_prompt_for_mode,
     stream_assistant_response,
     tool_functions_for_mode,
@@ -37,7 +31,6 @@ from learncode_agent.main import (
 from learncode_agent.terminal_style import (
     BG_GREEN,
     BG_RED,
-    PrefixedStream,
     color_unified_diff,
     colorize,
     render_terminal_markdown,
@@ -98,13 +91,6 @@ class EnvironmentLoadingTests(unittest.TestCase):
 
 
 class ModeSwitchingTests(unittest.TestCase):
-    def test_known_modes_do_not_require_artifacts(self):
-        state = SessionState()
-
-        self.assertTrue(can_enter_mode("plan", state))
-        self.assertTrue(can_enter_mode("build", state))
-        self.assertTrue(can_enter_mode("critic", state))
-
     def test_enter_mode_switches_without_artifact(self):
         state = SessionState()
 
@@ -118,7 +104,6 @@ class ModeSwitchingTests(unittest.TestCase):
 
         message = enter_mode(state, "review")
 
-        self.assertFalse(can_enter_mode("review", state))
         self.assertEqual(message, "Unknown mode: review")
         self.assertEqual(state.mode, "brainstorm")
 
@@ -260,73 +245,27 @@ class StreamingHelperTests(unittest.TestCase):
             },
         )
 
-    def test_stream_assistant_response_renders_visible_output_as_markdown(self):
+    def test_stream_assistant_response_delivers_visible_text_to_callback(self):
         class FakeCompletions:
             def create(self, **kwargs):
                 yield SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            delta=SimpleNamespace(content="**Hello**\nWor")
-                        )
-                    ]
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content="Hello\nLEAR"))]
                 )
                 yield SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            delta=SimpleNamespace(content="ld")
-                        )
-                    ]
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content='NCODE_HANDOFF: {"next_mode":"plan"}'))]
                 )
 
-        client = SimpleNamespace(
-            chat=SimpleNamespace(completions=FakeCompletions())
-        )
-        output = io.StringIO()
-
-        with redirect_stdout(output):
-            message = stream_assistant_response(
-                client, {"model": "test", "messages": []}
-            )
-
-        self.assertEqual(message["content"], "**Hello**\nWorld")
-        self.assertIn("● Hello World", output.getvalue())
-        self.assertTrue(output.getvalue().startswith("\n● Hello World"))
-        self.assertNotIn("**Hello**", output.getvalue())
-
-    def test_stream_assistant_response_can_stream_to_callback_without_stdout(self):
-        class FakeCompletions:
-            def create(self, **kwargs):
-                yield SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            delta=SimpleNamespace(content="Hello\nLEAR")
-                        )
-                    ]
-                )
-                yield SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            delta=SimpleNamespace(content='NCODE_HANDOFF: {"next_mode":"plan"}')
-                        )
-                    ]
-                )
-
-        client = SimpleNamespace(
-            chat=SimpleNamespace(completions=FakeCompletions())
-        )
+        client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
         visible_chunks = []
-        output = io.StringIO()
 
-        with redirect_stdout(output):
-            message = stream_assistant_response(
-                client,
-                {"model": "test", "messages": []},
-                on_visible_text=visible_chunks.append,
-            )
+        message = stream_assistant_response(
+            client,
+            {"model": "test", "messages": []},
+            on_visible_text=visible_chunks.append,
+        )
 
         self.assertEqual(message["content"], 'Hello\nLEARNCODE_HANDOFF: {"next_mode":"plan"}')
         self.assertEqual("".join(visible_chunks), "Hello\n")
-        self.assertEqual(output.getvalue(), "")
 
     def test_auto_prompts_cover_plan_and_build_only(self):
         self.assertEqual(AUTO_PROMPTS, {"plan": "Build Plan", "build": "Start Building"})
@@ -371,8 +310,7 @@ class StreamingHelperTests(unittest.TestCase):
         state.messages_by_mode["plan"] = [{"role": "system", "content": "Plan mode."}]
         client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
 
-        with redirect_stdout(io.StringIO()):
-            run_auto_prompt_for_mode(client, "test", state)
+        run_auto_prompt_for_mode(client, "test", state)
 
         self.assertEqual(
             state.messages_by_mode["plan"][1],
@@ -395,8 +333,7 @@ class StreamingHelperTests(unittest.TestCase):
         state.messages_by_mode["build"] = [{"role": "system", "content": "Build mode."}]
         client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
 
-        with redirect_stdout(io.StringIO()):
-            run_auto_prompt_for_mode(client, "test", state)
+        run_auto_prompt_for_mode(client, "test", state)
 
         self.assertEqual(
             state.messages_by_mode["build"][1],
@@ -430,8 +367,7 @@ class StreamingHelperTests(unittest.TestCase):
         state.messages_by_mode["build"] = [{"role": "system", "content": "Build mode."}]
         client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
 
-        with redirect_stdout(io.StringIO()):
-            run_auto_prompt_for_mode(client, "test", state)
+        run_auto_prompt_for_mode(client, "test", state)
 
         self.assertEqual(state.mode, "build")
         self.assertEqual(
@@ -445,15 +381,6 @@ class StreamingHelperTests(unittest.TestCase):
 
 
 class TerminalStyleTests(unittest.TestCase):
-    def test_prefixed_stream_prefixes_only_first_visible_line(self):
-        stream = PrefixedStream()
-
-        first_output = stream.feed("Hello\nWor")
-        final_output = stream.flush()
-
-        self.assertEqual(first_output, "● Hello\n")
-        self.assertEqual(final_output, "Wor")
-
     def test_colorize_can_be_disabled_for_plain_output(self):
         self.assertEqual(colorize("hello", "\033[32m", enable=False), "hello")
 
@@ -469,22 +396,7 @@ class TerminalStyleTests(unittest.TestCase):
         self.assertIn(BG_RED, rendered_output)
         self.assertIn(BG_GREEN, rendered_output)
 
-    def test_prompt_session_kwargs_uses_supported_prompt_arguments(self):
-        kwargs = prompt_session_kwargs(SessionState())
-
-        self.assertEqual(sorted(kwargs), ["message"])
-
-    def test_prompt_text_includes_current_mode(self):
-        self.assertEqual(prompt_text(SessionState(mode="build")), "[Build] > ")
-
-    def test_print_banner_writes_learncode_ascii_art(self):
-        output = io.StringIO()
-
-        with redirect_stdout(output):
-            print_banner()
-
-        self.assertIn(" _      _____", output.getvalue())
-        self.assertIn("|_____||_____", output.getvalue())
+    def test_learncode_banner_is_five_lines(self):
         self.assertEqual(len(LEARNCODE_BANNER.splitlines()), 5)
 
 

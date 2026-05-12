@@ -7,21 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from dotenv import load_dotenv
-from prompt_toolkit.formatted_text import ANSI
 
-from learncode_agent.terminal_style import (
-    BG_DARK,
-    BOLD,
-    CYAN,
-    DIM,
-    MAGENTA,
-    RED,
-    YELLOW,
-    PrefixedStream,
-    colorize,
-    mode_color,
-    render_terminal_markdown,
-)
 from learncode_agent.tools import (
     edit_file,
     make_directory,
@@ -177,10 +163,6 @@ def create_session_state() -> SessionState:
     return state
 
 
-def can_enter_mode(mode: str, state: SessionState) -> bool:
-    return mode in MODES
-
-
 def enter_mode(state: SessionState, mode: str, reset_messages: bool = False) -> str:
     if mode not in MODE_ORDER:
         return f"Unknown mode: {mode}"
@@ -285,33 +267,6 @@ class HandoffOutputFilter:
         return output
 
 
-def prompt_text(state: SessionState) -> str:
-    return f"[{state.mode.capitalize()}] > "
-
-
-def styled_prompt_text(state: SessionState) -> str:
-    label = colorize(f"[{state.mode.capitalize()}]", BOLD, mode_color(state.mode))
-    return f"{colorize(' ', BG_DARK)}{label}{colorize(' > ', DIM, BG_DARK)}"
-
-
-def print_status(message: str, mode: str | None = None) -> None:
-    color = mode_color(mode) if mode else CYAN
-    print(f"{colorize('●', BOLD, color)} {message}\n")
-
-
-def print_error(message: str) -> None:
-    print(f"{colorize(message, BOLD, RED)}\n")
-
-
-def print_banner() -> None:
-    print(colorize(LEARNCODE_BANNER, BOLD, CYAN))
-    print()
-
-
-def prompt_session_kwargs(state: SessionState) -> dict[str, Any]:
-    return {"message": lambda: ANSI(styled_prompt_text(state))}
-
-
 def append_user_message(state: SessionState, content: str) -> None:
     state.messages_by_mode[state.mode].append({"role": "user", "content": content})
 
@@ -322,18 +277,13 @@ def handle_streamed_handoff(
     output_sink: AgentOutputSink | None = None,
 ) -> str | None:
     _, handoff_payload, handoff_error = extract_handoff(content)
-    if handoff_error:
-        if output_sink:
-            output_sink.error(handoff_error)
-        else:
-            print_error(handoff_error)
+    if handoff_error and output_sink:
+        output_sink.error(handoff_error)
     if handoff_payload:
         previous_mode = state.mode
         message = apply_handoff(state, handoff_payload)
         if output_sink:
             output_sink.status(message, state.mode)
-        else:
-            print_status(message, state.mode)
         if state.mode != previous_mode:
             return state.mode
     return None
@@ -374,7 +324,6 @@ def stream_assistant_response(
 ) -> dict[str, Any]:
     stream = client.chat.completions.create(**request_kwargs, stream=True)
     content_parts: list[str] = []
-    visible_parts: list[str] = []
     tool_calls: dict[int, dict[str, Any]] = {}
     output_filter = HandoffOutputFilter()
 
@@ -387,28 +336,15 @@ def stream_assistant_response(
         if content_delta:
             content_parts.append(content_delta)
             visible_delta = output_filter.feed(content_delta)
-            if visible_delta:
-                visible_parts.append(visible_delta)
-                if on_visible_text:
-                    on_visible_text(visible_delta)
+            if visible_delta and on_visible_text:
+                on_visible_text(visible_delta)
 
         for tool_call_delta in getattr(delta, "tool_calls", None) or []:
             append_tool_call_delta(tool_calls, tool_call_delta)
 
     visible_tail = output_filter.flush()
-    if visible_tail:
-        visible_parts.append(visible_tail)
-        if on_visible_text:
-            on_visible_text(visible_tail)
-
-    visible_content = "".join(visible_parts)
-    if visible_content and not on_visible_text:
-        assistant_output = PrefixedStream(colorize("●", BOLD) + " ")
-        rendered_output = render_terminal_markdown(visible_content)
-        terminal_output = assistant_output.feed(rendered_output)
-        terminal_output += assistant_output.flush()
-        print(f"\n{terminal_output}", end="", flush=True)
-        print("\n")
+    if visible_tail and on_visible_text:
+        on_visible_text(visible_tail)
 
     message: dict[str, Any] = {
         "role": "assistant",
@@ -458,10 +394,6 @@ def run_agent_turn(
             kwargs = json.loads(tool_call["function"]["arguments"])
             if output_sink:
                 output_sink.tool_call(function_name, kwargs)
-            else:
-                tool_label = f"{colorize('●', BOLD, YELLOW)} Tool call"
-                function_label = colorize(function_name, BOLD, MAGENTA)
-                print(f"{tool_label} {function_label}({json.dumps(kwargs, indent=2)})\n")
             result = tool_executor(func, kwargs) if tool_executor else func(**kwargs)
             messages.append({
                 "role": "tool",

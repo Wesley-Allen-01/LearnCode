@@ -70,38 +70,6 @@ def mode_color(mode: str) -> str:
     return MODE_COLORS.get(mode, CYAN)
 
 
-class PrefixedStream:
-    def __init__(self, prefix: str = "● ") -> None:
-        self.prefix = prefix
-        self.pending = ""
-        self.started = False
-
-    def feed(self, text: str) -> str:
-        self.pending += text
-        output_parts: list[str] = []
-
-        while "\n" in self.pending:
-            line, self.pending = self.pending.split("\n", 1)
-            output_parts.append(self._prefix_once(line) + "\n")
-
-        return "".join(output_parts)
-
-    def flush(self) -> str:
-        if not self.pending:
-            return ""
-
-        output = self._prefix_once(self.pending)
-        self.pending = ""
-        return output
-
-    def _prefix_once(self, text: str) -> str:
-        if self.started:
-            return text
-
-        self.started = True
-        return f"{self.prefix}{text}"
-
-
 def color_unified_diff(diff_text: str, enable: bool | None = None) -> str:
     colored_lines = []
     for line in diff_text.splitlines(keepends=True):
